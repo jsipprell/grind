@@ -3,38 +3,62 @@ package main
 import (
 	"io"
 	"os"
-	"time"
 	"strings"
+	"time"
 
 	"github.com/miekg/dns"
 )
 
+type RRWithZone interface {
+	RR
+	Zone() *Zone
+}
+
 type Zone struct {
 	Origin string
-	Soa *dns.SOA
+	Soa    *dns.SOA
 
 	// NB: index 0 is always the SOA
 	RRs []RR
 
-	filename string
+	filename      string
+	authoritative bool
 }
 
 // static resource records, always report an expiration time that is equivalent
 // to time.Now() + ttl, as well as ignoring any attempts to update ttl
 type srrec struct {
 	*rrec
-	ttl time.Duration
+	ttl  time.Duration
+	zone *Zone
 }
 
 type streamNamer interface {
 	Name() string
 }
 
-func newStaticRR(rr dns.RR) *srrec {
+func newStaticRR(rr dns.RR, z *Zone) *srrec {
 	return &srrec{
-		rrec:&rrec{RR:rr},
-		ttl:time.Duration(rr.Header().Ttl) * time.Second,
+		rrec: &rrec{RR: rr},
+		ttl:  time.Duration(rr.Header().Ttl) * time.Second,
+		zone: z,
 	}
+}
+
+func (rr *srrec) Zone() *Zone {
+	return rr.zone
+}
+
+func (rr *srrec) clone() *srrec {
+	return &srrec{
+		rrec: rr.rrec.clone(),
+		ttl:  rr.ttl,
+		zone: rr.zone,
+	}
+}
+
+func (rr *srrec) Clone() RR {
+	return rr.clone()
 }
 
 func (rr *srrec) ExpireAt() time.Time {
@@ -52,6 +76,10 @@ func (z *Zone) AddToCache(cacher RRCacher) {
 	cacheViewAddSet(view, z.RRs, z)
 }
 
+func (z *Zone) IsAuthoritative() bool {
+	return z.authoritative
+}
+
 func LoadZone(r io.Reader) (*Zone, error) {
 	var name string
 	var err error
@@ -60,8 +88,9 @@ func LoadZone(r io.Reader) (*Zone, error) {
 	}
 	C := dns.ParseZone(r, "", name)
 	zone := &Zone{
-		filename:name,
-		RRs:make([]RR, 0, 1),
+		filename:      name,
+		RRs:           make([]RR, 0, 1),
+		authoritative: true,
 	}
 
 	for token := range C {
@@ -72,17 +101,17 @@ func LoadZone(r io.Reader) (*Zone, error) {
 			err = token.Error
 			continue
 		}
-		rr := newStaticRR(token.RR)
+		rr := newStaticRR(token.RR, zone)
 		if rr.Type() == dns.TypeSOA {
 			zone.Soa = rr.dnsRR().(*dns.SOA)
-			zone.RRs = append(zone.RRs,rr)
+			zone.RRs = append(zone.RRs, rr)
 			copy(zone.RRs[1:], zone.RRs)
 			zone.RRs[0] = rr
 			if zone.Origin == "" {
 				zone.Origin = strings.ToLower(dns.Fqdn(rr.Name()))
 			}
 		} else {
-			zone.RRs = append(zone.RRs,rr)
+			zone.RRs = append(zone.RRs, rr)
 		}
 	}
 	if closer, ok := r.(io.ReadCloser); ok {

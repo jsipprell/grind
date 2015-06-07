@@ -1,12 +1,11 @@
-
 package main
 
 import (
 	"log"
-	"time"
-	"strings"
 	"net"
+	_ "strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/miekg/dns"
 )
@@ -17,9 +16,9 @@ type Forwarder interface {
 }
 
 type forwarder struct {
-	c *dns.Client
+	c         *dns.Client
 	forwardTo []string
-	i uint32
+	i         uint32
 }
 
 type cachingForwarder struct {
@@ -64,7 +63,7 @@ func (f *forwarder) serve(r *dns.Msg) (m *dns.Msg, rrset []dns.RR, err error) {
 }
 
 func (f *forwarder) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
-	m, rtt, err := f.Exchange(r,"")
+	m, rtt, err := f.Exchange(r, "")
 	defer w.WriteMsg(m)
 
 	_ = rtt
@@ -79,7 +78,7 @@ func (f *forwarder) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 func (f *cachingForwarder) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	var rrset []dns.RR
 	var err error
-	l := f.cache.RLock()
+	var m *dns.Msg
 	defer func() {
 		if len(rrset) > 0 {
 			err := f.cache.Update(rrset...)
@@ -89,48 +88,17 @@ func (f *cachingForwarder) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 			log.Println("forward cache update completed")
 		}
 	}()
-	defer l.RUnlock()
-	if rrset, err = f.cache.Lookup(r.Question...); err == nil && len(rrset) > 0 {
-		m := new(dns.Msg)
-		m.SetReply(r)
-		remain := make([]dns.RR, 0, len(rrset))
-		for _, rr := range rrset {
-			hdr := rr.Header()
-			for _, q := range r.Question {
-				if strings.ToLower(q.Name) == strings.ToLower(hdr.Name) {
-					if q.Qtype == dns.TypeANY || hdr.Rrtype == q.Qtype {
-						if q.Qclass == 0 || hdr.Class == q.Qclass {
-						  m.Answer = append(m.Answer, dns.Copy(rr))
-							continue
-						}
-					}
-				}
-				remain = append(remain, rr)
-			}
-		}
-		for _, rr := range remain {
-			if rr.Header().Rrtype == dns.TypeNS {
-				m.Ns = append(m.Ns, dns.Copy(rr))
-				continue
-			}
-			m.Extra = append(m.Extra, dns.Copy(rr))
-		}
-		if len(m.Answer) == 0 {
-			m.SetRcode(r, dns.RcodeNameError)
-		} else {
-			defer w.WriteMsg(m)
-			rrset = nil
-			return
-		}
-	}
-	m, rrset, err := f.serve(r)
+	m, rrset, err = f.serve(r)
 	defer w.WriteMsg(m)
 
 	if err != nil {
 		m = new(dns.Msg)
-		m.SetRcodeFormatError(r)
+		m.SetRcode(r, dns.RcodeServerFailure)
 		log.Println(err)
-		return
+		rrset = nil
+	} else if m.Rcode != dns.RcodeSuccess {
+		// don't cache error
+		rrset = nil
 	}
 	return
 }
@@ -141,13 +109,13 @@ func NewForwarder(netwrk string, addr ...string) (Forwarder, error) {
 		if e != nil || p == "" {
 			p = "53"
 		}
-		addr[i] = net.JoinHostPort(h,p)
+		addr[i] = net.JoinHostPort(h, p)
 	}
 	return &forwarder{
-		c:&dns.Client{
-			Net:netwrk,
+		c: &dns.Client{
+			Net: netwrk,
 		},
-		forwardTo:addr,
+		forwardTo: addr,
 	}, nil
 }
 
@@ -155,11 +123,9 @@ func NewCachingForwarder(cache *RRCache, netwrk string, addr ...string) (Forward
 	f, err := NewForwarder(netwrk, addr...)
 	if err == nil {
 		return &cachingForwarder{
-			forwarder:f.(*forwarder),
-			cache:cache,
+			forwarder: f.(*forwarder),
+			cache:     cache,
 		}, err
 	}
 	return nil, err
 }
-
-

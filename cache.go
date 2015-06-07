@@ -2,16 +2,16 @@
 package main
 
 import (
-	"strings"
+	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"time"
-	"errors"
 
-	"golang.org/x/net/context"
 	"github.com/jsipprell/grind/barricade"
-	"github.com/ryszard/goskiplist/skiplist"
 	"github.com/miekg/dns"
+	"github.com/ryszard/goskiplist/skiplist"
+	"golang.org/x/net/context"
 )
 
 var (
@@ -28,12 +28,14 @@ type RR interface {
 	ExpireAt() time.Time
 	dnsRR() dns.RR
 	calcTTL() uint32
+
+	Clone() RR
 }
 
 type RRCacheView struct {
 	barricade.Barricade
 
-	expList *skiplist.SkipList
+	expList  *skiplist.SkipList
 	nameList *skiplist.SkipList
 
 	verbose bool
@@ -42,9 +44,9 @@ type RRCacheView struct {
 type RRCache struct {
 	*RRCacheView
 
-	snapshot *snapshot
+	snapshot    *snapshot
 	snapshotCtx context.Context
-	sem chan struct{}
+	sem         chan struct{}
 }
 
 type rrec struct {
@@ -52,7 +54,7 @@ type rrec struct {
 
 	rcode *uint16
 	expAt time.Time
-	Key string
+	Key   string
 }
 
 func (rr *rrec) ExpireAt() time.Time {
@@ -63,6 +65,29 @@ func (rr *rrec) dnsRR() dns.RR {
 	return rr.RR
 }
 
+func (rr *rrec) clone() *rrec {
+	var rcode *uint16
+
+	if rr.rcode != nil {
+		rcode = new(uint16)
+		*rcode = *rr.rcode
+	}
+
+	rr = &rrec{
+		RR:    dns.Copy(rr.RR),
+		rcode: rcode,
+		expAt: rr.expAt,
+		Key:   rr.Key,
+	}
+
+	rr.RR.Header().Ttl = rr.calcTTL()
+	return rr
+}
+
+func (rr *rrec) Clone() RR {
+	return rr.clone()
+}
+
 func (rr *rrec) calcTTL() uint32 {
 	if !rr.expAt.IsZero() {
 		var ttl uint32
@@ -70,7 +95,7 @@ func (rr *rrec) calcTTL() uint32 {
 		if when < 0 {
 			when = 0
 		} else {
-			ttl = uint32(when / time.Second)+1
+			ttl = uint32(when/time.Second) + 1
 		}
 		return ttl
 	}
@@ -84,36 +109,50 @@ func (rr *rrec) ZoneString() string {
 		if when < 0 {
 			when = 0
 		} else {
-			ttl = uint32(when / time.Second)+1
+			ttl = uint32(when/time.Second) + 1
 		}
 		rr.RR.Header().Ttl = ttl
 	}
 	return rr.RR.String()
 }
 
+type notifyChan <-chan struct{}
+
 // NB: absolutely not thread safe, only use with appropriate locking/isolation
-func (view *RRCacheView) lookup(includeGlue bool,matching ...Matcher) []RR {
+func (view *RRCacheView) lookup(includeGlue bool, matching ...Matcher) []RR {
+	var notify []notifyChan
+
 	rrseen := make(map[dns.RR]struct{})
 	gluerecs := make(map[string]struct{})
 	result := make([]RR, 0, 1)
 	i := view.nameList.Iterator()
 	defer i.Close()
-	matchingC := make(chan Matcher, len(matching))
+	matchingQ := NewQueue(len(matching))
+	defer matchingQ.Cancel()
 	for _, m := range matching {
-		matchingC <- m
+		matchingQ.Push(m)
 	}
-	if len(matchingC) == 0 {
-		close(matchingC)
-	}
-	for m := range matchingC {
-		var addl int
+
+	for nextMatcher := range matchingQ.C {
+		m, _ := nextMatcher().(Matcher)
+		for m == nil && len(notify) > 0 {
+			if ln := len(notify); ln > 0 {
+				<-notify[0]
+				if ln > 1 {
+					copy(notify[:], notify[1:])
+					notify[ln-1] = nil
+				}
+				notify = notify[:ln-1]
+			}
+			m, _ = nextMatcher().(Matcher)
+		}
+		if m == nil {
+			break
+		}
 		name := m.Name()
 		//log.Printf("   MATCH <%s>", name)
 		start, _, ok := view.nameList.GetGreaterOrEqual(name)
 		if !ok || !i.Seek(start) {
-			if len(matchingC) == 0 {
-				close(matchingC)
-			}
 			continue
 		}
 		for rr, ok := i.Key().(RR); ok; rr, ok = i.Key().(RR) {
@@ -133,18 +172,18 @@ func (view *RRCacheView) lookup(includeGlue bool,matching ...Matcher) []RR {
 						gluerecs[nsname] = struct{}{}
 						m := newMatcher(nsname)
 						//log.Println("----> NSNAME ",nsname)
-						m.AddMatch(MatchOpType, dns.TypeA)
+						m.AddMatch(MatchOpTypeSlice, []uint16{dns.TypeA, dns.TypeAAAA})
 						m.AddMatch(MatchOpName, nsname)
-						matching = append(matching, m)
-						waitC := make(chan struct{}, 1)
-						go func(c chan struct{}, mc chan<- Matcher, m Matcher) {
-							defer close(c)
-							mc <- m
-						}(waitC, matchingC, m)
-						if len(matchingC) < cap(matchingC) {
-							<-waitC
-						}
-						addl++
+						notify = append(notify, matchingQ.PushAsync(m))
+					}
+				} else if rr.Type() == dns.TypeCNAME {
+					target := strings.ToLower(dns.Fqdn(rr.dnsRR().(*dns.CNAME).Target))
+					if _, ok := gluerecs[target]; !ok {
+						gluerecs[target] = struct{}{}
+						m := newMatcher(target)
+						m.AddMatch(MatchOpTypeSlice, []uint16{dns.TypeA, dns.TypeAAAA, dns.TypePTR, dns.TypeCNAME})
+						m.AddMatch(MatchOpName, target)
+						notify = append(notify, matchingQ.PushAsync(m))
 					}
 				}
 			} else if name != strings.ToLower(rr.Name()) {
@@ -153,9 +192,6 @@ func (view *RRCacheView) lookup(includeGlue bool,matching ...Matcher) []RR {
 			if !i.Next() {
 				break
 			}
-		}
-		if len(matchingC) == 0 {
-			close(matchingC)
 		}
 	}
 	return result
@@ -197,8 +233,100 @@ func (view *RRCacheView) updateFromRRset(rrset []dns.RR, zones ...*Zone) {
 
 func (view *RRCacheView) update(vals ...interface{}) {
 	for _, v := range vals {
-		_, _ = cacheViewUpdate(view,v)
+		_, _ = cacheViewUpdate(view, v)
 	}
+}
+
+func cacheViewShadowUpdate(shadow RRCacher, view *RRCacheView, v interface{}, zones ...*Zone) ([]RR, []RR) {
+	var z *Zone
+
+	srcview := shadow.View()
+	L := srcview.RLock()
+	defer L.RUnlock()
+
+	i := srcview.nameList.Iterator()
+	defer i.Close()
+	vi := view.nameList.Iterator()
+	if vi != nil {
+		defer vi.Close()
+	}
+	if len(zones) > 0 {
+		z = zones[0]
+	}
+
+	dellist := make([]RR, 0, 1)
+	addlist := make([]RR, 0, 1)
+	switch r := v.(type) {
+	case Matcher:
+		name := strings.ToLower(r.Name())
+		start, _, ok := view.nameList.GetGreaterOrEqual(name)
+		if ok && vi.Seek(start) {
+			tmpdel := make([]RR, 0, 1)
+			for rr, ok := i.Key().(RR); ok; rr, ok = i.Key().(RR) {
+				if r.Match(rr) {
+					tmpdel = append(tmpdel, rr)
+					continue
+				} else if strings.ToLower(rr.Name()) != name {
+					break
+				}
+				if !i.Next() {
+					break
+				}
+			}
+			for _, rr := range tmpdel {
+				for o, ok := view.nameList.Delete(rr); ok && o != nil; {
+					o, ok = view.nameList.Delete(rr)
+				}
+				for o, ok := view.expList.Delete(rr); ok && o != nil; {
+					o, ok = view.expList.Delete(rr)
+				}
+			}
+			tmpdel = tmpdel[:0]
+		}
+		start, _, ok = srcview.nameList.GetGreaterOrEqual(name)
+		if ok {
+			ok = i.Seek(start)
+		}
+		if !ok {
+			if rr := r.GetRR(); rr != nil {
+				view.nameList.Set(rr, z)
+				view.expList.Set(rr, z)
+				addlist = append(addlist, rr)
+			}
+			return addlist, dellist
+		}
+		count := 0
+		for rr, ok := i.Key().(RR); ok; rr, ok = i.Key().(RR) {
+			if r.Match(rr) {
+				count++
+				dellist = append(dellist, rr)
+				if rr = r.GetRR(); rr != nil {
+					view.nameList.Set(rr, z)
+					view.expList.Set(rr, z)
+					addlist = append(addlist, rr)
+				}
+			} else if name != strings.ToLower(rr.Name()) {
+				if rr = r.GetRR(); rr != nil && count == 0 {
+					view.nameList.Set(rr, z)
+					view.expList.Set(rr, z)
+					addlist = append(addlist, rr)
+				}
+				break
+			}
+			if ok = i.Next(); !ok {
+				if rr = r.GetRR(); rr != nil && count == 0 {
+					view.nameList.Set(rr, z)
+					view.expList.Set(rr, z)
+					addlist = append(addlist, rr)
+				}
+				break
+			}
+		}
+	case interface{}:
+		panic("bad type")
+	}
+
+	return addlist, dellist
 }
 
 func cacheViewUpdate(view *RRCacheView, v interface{}, zones ...*Zone) ([]RR, []RR) {
@@ -214,7 +342,8 @@ func cacheViewUpdate(view *RRCacheView, v interface{}, zones ...*Zone) ([]RR, []
 	addlist := make([]RR, 0, 1)
 	switch r := v.(type) {
 	case Matcher:
-		start, _, ok := view.nameList.GetGreaterOrEqual(r.Name())
+		name := strings.ToLower(r.Name())
+		start, _, ok := view.nameList.GetGreaterOrEqual(name)
 		if ok {
 			ok = i.Seek(start)
 		}
@@ -227,22 +356,24 @@ func cacheViewUpdate(view *RRCacheView, v interface{}, zones ...*Zone) ([]RR, []
 			return addlist, nil
 		}
 		count := 0
-		name := strings.ToLower(r.Name())
 		for rr, ok := i.Key().(RR); ok; rr, ok = i.Key().(RR) {
 			if r.Match(rr) {
 				count++
 				dellist = append(dellist, rr)
 				if rr = r.GetRR(); rr != nil {
+					dellist = append(dellist, rr)
 					addlist = append(addlist, rr)
 				}
 			} else if name != strings.ToLower(rr.Name()) {
 				if rr = r.GetRR(); rr != nil && count == 0 {
+					dellist = append(dellist, rr)
 					addlist = append(addlist, rr)
 				}
 				break
 			}
 			if ok = i.Next(); !ok {
 				if rr = r.GetRR(); rr != nil && count == 0 {
+					dellist = append(dellist, rr)
 					addlist = append(addlist, rr)
 				}
 				break
@@ -255,21 +386,28 @@ func cacheViewUpdate(view *RRCacheView, v interface{}, zones ...*Zone) ([]RR, []
 	rdellist := make([]RR, 0, len(dellist))
 
 	for _, rr := range dellist {
-		_, ok1 := view.expList.Delete(rr)
-		_, ok2 := view.nameList.Delete(rr)
+		var ok1, ok2 bool
+		for o, ok := view.nameList.Delete(rr); ok && o != nil; {
+			ok1 = true
+			o, ok = view.nameList.Delete(rr)
+		}
+		for o, ok := view.expList.Delete(rr); ok && o != nil; {
+			ok2 = true
+			o, ok = view.expList.Delete(rr)
+		}
 		if ok1 || ok2 {
 			if view.verbose {
-				//log.Printf("MERGE: del %+v", rr)
+				log.Printf("MERGE: del %+v", rr)
 			}
 			rdellist = append(rdellist, rr)
 		}
 	}
 	for _, rr := range addlist {
 		if view.verbose {
-			//log.Printf("MERGE: add %+v", rr)
+			log.Printf("MERGE: add %+v", rr)
 		}
-		view.expList.Set(rr, z)
 		view.nameList.Set(rr, z)
+		view.expList.Set(rr, z)
 	}
 
 	return addlist, rdellist
@@ -286,41 +424,6 @@ func (view *RRCacheView) del(vals ...interface{}) int {
 
 func cacheViewDel(view *RRCacheView, v interface{}) (n int) {
 	switch r := v.(type) {
-	case string:
-		r = strings.ToLower(r)
-		start, _, ok := view.nameList.GetGreaterOrEqual(r)
-		if !ok {
-			return
-		}
-		i := view.nameList.Iterator()
-		defer i.Close()
-		if !i.Seek(start) {
-			return
-		}
-		todel := make([]RR, 0, 1)
-		for rr, ok := i.Key().(RR); ok; rr, ok = i.Key().(RR) {
-			if rr.Name() == r {
-				todel = append(todel, rr)
-			} else {
-				break
-			}
-			if !i.Next() {
-				break
-			}
-		}
-		for _, rr := range todel {
-			_, ok1 := view.nameList.Delete(rr)
-			_, ok2 := view.expList.Delete(rr)
-			if ok1 || ok2 {
-				n++
-			}
-		}
-	case RR:
-		_, ok1 := view.nameList.Delete(r)
-		_, ok2 := view.expList.Delete(r)
-		if ok1 || ok2 {
-			n++
-		}
 	case Matcher:
 		name := r.Name()
 		start, _, ok := view.nameList.GetGreaterOrEqual(name)
@@ -344,11 +447,67 @@ func cacheViewDel(view *RRCacheView, v interface{}) (n int) {
 			}
 		}
 		for _, rr := range todel {
-			_, ok1 := view.nameList.Delete(rr)
-			_, ok2 := view.expList.Delete(rr)
+			var ok1, ok2 bool
+			for o, ok := view.nameList.Delete(rr); ok && o != nil; {
+				ok1 = true
+				o, ok = view.nameList.Delete(rr)
+			}
+			for o, ok := view.expList.Delete(rr); ok && o != nil; {
+				ok2 = true
+				o, ok = view.expList.Delete(rr)
+			}
 			if ok1 || ok2 {
 				n++
 			}
+		}
+	case string:
+		r = strings.ToLower(r)
+		start, _, ok := view.nameList.GetGreaterOrEqual(r)
+		if !ok {
+			return
+		}
+		i := view.nameList.Iterator()
+		defer i.Close()
+		if !i.Seek(start) {
+			return
+		}
+		todel := make([]RR, 0, 1)
+		for rr, ok := i.Key().(RR); ok; rr, ok = i.Key().(RR) {
+			if rr.Name() == r {
+				todel = append(todel, rr)
+			} else {
+				break
+			}
+			if !i.Next() {
+				break
+			}
+		}
+		for _, rr := range todel {
+			var ok1, ok2 bool
+			for o, ok := view.nameList.Delete(rr); ok && o != nil; {
+				ok1 = true
+				o, ok = view.nameList.Delete(rr)
+			}
+			for o, ok := view.expList.Delete(rr); ok && o != nil; {
+				ok2 = true
+				o, ok = view.expList.Delete(rr)
+			}
+			if ok1 || ok2 {
+				n++
+			}
+		}
+	case RR:
+		var ok1, ok2 bool
+		for o, ok := view.nameList.Delete(r); ok && o != nil; {
+			ok1 = true
+			o, ok = view.nameList.Delete(r)
+		}
+		for o, ok := view.expList.Delete(r); ok && o != nil; {
+			ok2 = true
+			o, ok = view.expList.Delete(r)
+		}
+		if ok1 || ok2 {
+			n++
 		}
 	}
 	return
@@ -399,13 +558,16 @@ func (r *rrec) Match(v interface{}) bool {
 			ok = rt == tt || rt == dns.TypeANY
 			tok = rt == tt && rt != dns.TypeANY
 		}
-		if ok && t.Class() != 0 && r.Class() != 0 {
-			ok = t.Class() == r.Class()
-			if ok && tok {
-				trr, rrr := t.dnsRR(), r.RR
-				ok = CompareRRData(trr,rrr)
-				//log.Printf("COMPARE %+v %+v: %v", trr, rrr, ok)
-			}
+		if ok {
+			rt := r.Class()
+			tt := t.Class()
+			ok = rt == tt || rt == dns.ClassANY || rt == 0
+			tok = tok && (rt == tt && rt != dns.ClassANY)
+		}
+		if ok && tok {
+			ok = CompareRRData(t.dnsRR(), r.RR)
+		} else {
+			ok = tok
 		}
 	case string:
 		ok = t == r.Name()
@@ -424,7 +586,7 @@ func newRR(rr dns.RR) *rrec {
 }
 
 func newPermRR(rr dns.RR) RR {
-	return &rrec{RR:rr}
+	return &rrec{RR: rr}
 }
 
 func newRcodeRR(name string, rcode uint16, ttl uint32) RR {
@@ -466,8 +628,8 @@ func (view *RRCacheView) MaxLeveL() int {
 func newRRCacheView() *RRCacheView {
 	view := &RRCacheView{
 		Barricade: barricade.New(1),
-		expList: skiplist.NewCustomMap(slOrderByExpire),
-		nameList: skiplist.NewCustomMap(slOrderByName),
+		expList:   skiplist.NewCustomMap(slOrderByExpire),
+		nameList:  skiplist.NewCustomMap(slOrderByName),
 	}
 	view.SetMaxLevel(16)
 	return view
@@ -475,12 +637,12 @@ func newRRCacheView() *RRCacheView {
 
 func NewRRCache(concurrency int) *RRCache {
 	cache := &RRCache{
-		RRCacheView:&RRCacheView{
+		RRCacheView: &RRCacheView{
 			Barricade: barricade.New(concurrency),
-			expList: skiplist.NewCustomMap(slOrderByExpire),
-			nameList: skiplist.NewCustomMap(slOrderByName),
+			expList:   skiplist.NewCustomMap(slOrderByExpire),
+			nameList:  skiplist.NewCustomMap(slOrderByName),
 		},
-		sem:make(chan struct{},1),
+		sem: make(chan struct{}, 1),
 	}
 	cache.sem <- struct{}{}
 	cache.SetMaxLevel(16)
@@ -510,7 +672,7 @@ func (cache *RRCache) Update(rrset ...dns.RR) error {
 	}
 
 	g := make(chan error, 2)
-	upd := snapReqUpd{gate:g}
+	upd := snapReqUpd{gate: g}
 	upd.updSet = make([]Matcher, len(rrset))
 	for i, rr := range rrset {
 		upd.updSet[i] = newMatcher(newRR(rr))
@@ -526,9 +688,14 @@ func (cache *RRCache) Update(rrset ...dns.RR) error {
 	return err
 }
 
-func (cache *RRCache) Lookup(qr ...dns.Question) ([]dns.RR, error) {
+func (cache *RRCache) LookupSafe(qr ...dns.Question) ([]RR, error) {
 	L := cache.Barricade.RLock()
 	defer L.RUnlock()
+
+	return cache.Lookup(qr...)
+}
+
+func (cache *RRCache) Lookup(qr ...dns.Question) ([]RR, error) {
 
 	soaMatchers := make(map[string]Matcher)
 	matchers := make([]Matcher, 0, 2)
@@ -545,7 +712,7 @@ func (cache *RRCache) Lookup(qr ...dns.Question) ([]dns.RR, error) {
 			if q.Qtype == dns.TypeSOA {
 				continue
 			}
-			if len(labels) >  1 {
+			if len(labels) > 1 {
 				parent := name[labels[1]:]
 				if _, ok := soaMatchers[parent]; !ok {
 					m = newMatcher(parent)
@@ -566,24 +733,26 @@ func (cache *RRCache) Lookup(qr ...dns.Question) ([]dns.RR, error) {
 		m = newMatcher(name)
 		m.AddMatch(MatchOpName, name)
 		if q.Qtype != dns.TypeANY {
-			m.AddMatch(MatchOpType, q.Qtype)
+			if q.Qtype == dns.TypeA || q.Qtype == dns.TypeAAAA || q.Qtype == dns.TypePTR {
+				m.AddMatch(MatchOpTypeSlice, []uint16{q.Qtype, dns.TypeCNAME})
+				log.Println("MatchOpTypeSlice")
+			} else {
+				m.AddMatch(MatchOpType, q.Qtype)
+			}
 		}
 		if q.Qclass != 0 {
 			m.AddMatch(MatchOpClass, q.Qclass)
 		}
 		matchers = append(matchers, m)
 	}
-	results := cache.lookup(true,matchers...)
+	results := cache.lookup(true, matchers...)
 	if len(results) == 0 {
 		//log.Printf("NXDOMAIN: %+v", qr)
 		return nil, ErrCacheNXDOMAIN
 	}
-	rset := make([]dns.RR, len(results))
-	for i, rr := range results {
-		crr := dns.Copy(rr.dnsRR())
-		crr.Header().Ttl = rr.calcTTL()
-		rset[i] = crr
-	}
-	return rset, nil
-}
 
+	for i, rr := range results {
+		results[i] = rr.Clone()
+	}
+	return results, nil
+}
