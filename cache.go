@@ -24,11 +24,14 @@ type RRCacher interface {
 
 type RR interface {
 	Matcher
+	RRish
 	ZoneString() string
 	ExpireAt() time.Time
 	dnsRR() dns.RR
 	calcTTL() uint32
 
+	Type() uint16
+	Class() uint16
 	Clone() RR
 }
 
@@ -119,6 +122,88 @@ func (rr *rrec) ZoneString() string {
 type notifyChan <-chan struct{}
 
 // NB: absolutely not thread safe, only use with appropriate locking/isolation
+func (view *RRCacheView) add(key RRish, v interface{}) {
+	view.nameList.Set(key.GetRR(), v)
+	view.expList.Set(key.GetRR(), v)
+}
+
+func (view *RRCacheView) remove(key Matcher) (v interface{}, ok bool) {
+	if rrish, rrok := key.(RRish); rrok {
+		rr := rrish.GetRR()
+		if v, ok = view.nameList.Delete(rr); ok {
+			if view.verbose {
+				log.Printf("  -- VIEW -- removed '%+v' (namelist)", rr)
+			}
+			if v != nil {
+				if _, ok := view.expList.Delete(rr); ok && view.verbose {
+					log.Printf("  -- VIEW -- removed '%+v' (explist)", rr)
+				}
+			} else {
+				if v, ok = view.expList.Delete(rr); ok && view.verbose {
+					log.Printf("  -- VIEW -- removed '%+v' (explist)", rr)
+				}
+			}
+		} else if v == nil {
+			if v, ok = view.expList.Delete(rr); ok {
+				log.Printf("  -- VIEW -- removed '%+v' (explist)", rr)
+			}
+		} else {
+			if _, ok := view.expList.Delete(rr); ok {
+				log.Printf("  -- VIEW -- removed '%+v' (explist)", rr)
+			}
+		}
+		if view.verbose {
+			log.Println("  -- VIEW -- DIRECT REMOVE COMPLETE")
+		}
+		return
+	}
+
+	var count int
+	var vk interface{}
+
+	name := strings.ToLower(key.Name())
+	vk, v, ok = view.nameList.GetGreaterOrEqual(name)
+	i := view.nameList.Seek(name)
+	if i == nil {
+		return
+	}
+	defer i.Close()
+	for ok := i.Previous(); ok;  ok = i.Previous() {
+		if i.Key().(RR).Name() != name {
+			i.Next()
+			break
+		}
+	}
+	vk,v = i.Key(), i.Value()
+	for rr := vk.(RR); rr != nil && rr.Name() == name; rr, v = i.Key().(RR), i.Value() {
+		if view.verbose {
+			log.Printf("  -- VIEW -- MATCHING REMOVE EXAMINE: key=%q, vk=%+v, v=%+v, ok=%v", name, vk, v, ok)
+		}
+		if key.Match(rr) {
+			var rok bool
+			if v, rok = view.nameList.Delete(rr); rok {
+				count++
+				if view.verbose {
+					log.Printf("  -- VIEW -- '%#v' REMOVE MATCH (namelist) '%+v'", key, rr)
+				}
+			} else if view.verbose {
+				log.Printf("  -- VIEW -- WARNING WARNING: '%#v' matched but failed to delete %v", key, rr)
+			}
+			if _, rok = view.expList.Delete(rr); rok && view.verbose {
+				log.Printf("  -- VIEW -- '%#v' REMOVE MATCH (explist) '%+v'", key, rr)
+			}
+		} else if view.verbose {
+			log.Printf("  -- VIEW -- NOMATCH '%#v' doesn't match '%+v'", key, rr)
+		}
+		if ok = i.Next(); !ok {
+			break
+		}
+	}
+
+	ok = count > 0
+	return
+}
+
 func (view *RRCacheView) lookup(includeGlue bool, matching ...Matcher) []RR {
 	var notify []notifyChan
 
@@ -210,8 +295,7 @@ func cacheViewAddSet(view *RRCacheView, rrset []RR, zones ...*Zone) {
 		} else if nzones > 0 {
 			z = zones[nzones-1]
 		}
-		view.expList.Set(rr, z)
-		view.nameList.Set(rr, z)
+		view.add(rr,z)
 	}
 }
 
@@ -221,8 +305,7 @@ func cacheViewAdd(view *RRCacheView, r RR, zones ...*Zone) {
 	if len(zones) > 0 {
 		z = zones[0]
 	}
-	view.expList.Set(r, z)
-	view.nameList.Set(r, z)
+	view.add(r,z)
 }
 
 func (view *RRCacheView) updateFromRRset(rrset []dns.RR, zones ...*Zone) {
@@ -231,10 +314,39 @@ func (view *RRCacheView) updateFromRRset(rrset []dns.RR, zones ...*Zone) {
 	}
 }
 
-func (view *RRCacheView) update(vals ...interface{}) {
+func (view *RRCacheView) update(vals ...Matcher) {
+	defer func() {
+		if e := recover(); e != nil {
+			log.Fatal(e)
+		}
+	}()
+
 	for _, v := range vals {
-		_, _ = cacheViewUpdate(view, v)
+		switch rr := v.(type) {
+		case RRish:
+			if view.verbose {
+				log.Printf("  -- VIEW -- removing '%+v' prior to re-add", v)
+			}
+			view.remove(v)
+			if view.verbose {
+				log.Println("  -- VIEW -- removed")
+			}
+			if rz, ok := rr.(RRWithZone); ok {
+				view.add(rr, rz.Zone())
+				if view.verbose {
+					log.Printf("  -- VIEW -- added '%+v' to zone %v", rr, rz.Zone())
+				}
+			} else {
+				view.add(rr, nil)
+				if view.verbose {
+					log.Printf("  -- VIEW -- added '%+v'", rr)
+				}
+			}
+			continue
+		}
+		panic("unsupport cachview key type")
 	}
+		//_, _ = cacheViewUpdate(view, v)
 }
 
 func cacheViewShadowUpdate(shadow RRCacher, view *RRCacheView, v interface{}, zones ...*Zone) ([]RR, []RR) {
@@ -274,12 +386,7 @@ func cacheViewShadowUpdate(shadow RRCacher, view *RRCacheView, v interface{}, zo
 				}
 			}
 			for _, rr := range tmpdel {
-				for o, ok := view.nameList.Delete(rr); ok && o != nil; {
-					o, ok = view.nameList.Delete(rr)
-				}
-				for o, ok := view.expList.Delete(rr); ok && o != nil; {
-					o, ok = view.expList.Delete(rr)
-				}
+				_, ok = view.remove(rr)
 			}
 			tmpdel = tmpdel[:0]
 		}
@@ -288,9 +395,8 @@ func cacheViewShadowUpdate(shadow RRCacher, view *RRCacheView, v interface{}, zo
 			ok = i.Seek(start)
 		}
 		if !ok {
-			if rr := r.GetRR(); rr != nil {
-				view.nameList.Set(rr, z)
-				view.expList.Set(rr, z)
+			if rr, _ := GetRR(r); rr != nil {
+				view.add(rr,z)
 				addlist = append(addlist, rr)
 			}
 			return addlist, dellist
@@ -300,23 +406,20 @@ func cacheViewShadowUpdate(shadow RRCacher, view *RRCacheView, v interface{}, zo
 			if r.Match(rr) {
 				count++
 				dellist = append(dellist, rr)
-				if rr = r.GetRR(); rr != nil {
-					view.nameList.Set(rr, z)
-					view.expList.Set(rr, z)
+				if rr, _ = GetRR(r); rr != nil {
+					view.add(rr,z)
 					addlist = append(addlist, rr)
 				}
 			} else if name != strings.ToLower(rr.Name()) {
-				if rr = r.GetRR(); rr != nil && count == 0 {
-					view.nameList.Set(rr, z)
-					view.expList.Set(rr, z)
+				if rr, _ = GetRR(r); rr != nil && count == 0 {
+					view.add(rr,z)
 					addlist = append(addlist, rr)
 				}
 				break
 			}
 			if ok = i.Next(); !ok {
-				if rr = r.GetRR(); rr != nil && count == 0 {
-					view.nameList.Set(rr, z)
-					view.expList.Set(rr, z)
+				if rr, _ = GetRR(r); rr != nil && count == 0 {
+					view.add(rr,z)
 					addlist = append(addlist, rr)
 				}
 				break
@@ -349,7 +452,7 @@ func cacheViewUpdate(view *RRCacheView, v interface{}, zones ...*Zone) ([]RR, []
 		}
 
 		if !ok {
-			if rr := r.GetRR(); rr != nil {
+			if rr, _ := GetRR(r); rr != nil {
 				cacheViewAdd(view, rr, zones...)
 				addlist = append(addlist, rr)
 			}
@@ -360,19 +463,19 @@ func cacheViewUpdate(view *RRCacheView, v interface{}, zones ...*Zone) ([]RR, []
 			if r.Match(rr) {
 				count++
 				dellist = append(dellist, rr)
-				if rr = r.GetRR(); rr != nil {
+				if rr, _ = GetRR(r); rr != nil {
 					dellist = append(dellist, rr)
 					addlist = append(addlist, rr)
 				}
 			} else if name != strings.ToLower(rr.Name()) {
-				if rr = r.GetRR(); rr != nil && count == 0 {
+				if rr, _ = GetRR(r); rr != nil && count == 0 {
 					dellist = append(dellist, rr)
 					addlist = append(addlist, rr)
 				}
 				break
 			}
 			if ok = i.Next(); !ok {
-				if rr = r.GetRR(); rr != nil && count == 0 {
+				if rr, _ = GetRR(r); rr != nil && count == 0 {
 					dellist = append(dellist, rr)
 					addlist = append(addlist, rr)
 				}
@@ -386,16 +489,7 @@ func cacheViewUpdate(view *RRCacheView, v interface{}, zones ...*Zone) ([]RR, []
 	rdellist := make([]RR, 0, len(dellist))
 
 	for _, rr := range dellist {
-		var ok1, ok2 bool
-		for o, ok := view.nameList.Delete(rr); ok && o != nil; {
-			ok1 = true
-			o, ok = view.nameList.Delete(rr)
-		}
-		for o, ok := view.expList.Delete(rr); ok && o != nil; {
-			ok2 = true
-			o, ok = view.expList.Delete(rr)
-		}
-		if ok1 || ok2 {
+		if _, ok := view.remove(rr); ok {
 			if view.verbose {
 				log.Printf("MERGE: del %+v", rr)
 			}
@@ -406,8 +500,7 @@ func cacheViewUpdate(view *RRCacheView, v interface{}, zones ...*Zone) ([]RR, []
 		if view.verbose {
 			log.Printf("MERGE: add %+v", rr)
 		}
-		view.nameList.Set(rr, z)
-		view.expList.Set(rr, z)
+		view.add(rr,z)
 	}
 
 	return addlist, rdellist
@@ -447,16 +540,7 @@ func cacheViewDel(view *RRCacheView, v interface{}) (n int) {
 			}
 		}
 		for _, rr := range todel {
-			var ok1, ok2 bool
-			for o, ok := view.nameList.Delete(rr); ok && o != nil; {
-				ok1 = true
-				o, ok = view.nameList.Delete(rr)
-			}
-			for o, ok := view.expList.Delete(rr); ok && o != nil; {
-				ok2 = true
-				o, ok = view.expList.Delete(rr)
-			}
-			if ok1 || ok2 {
+			if _, ok := view.remove(rr); ok {
 				n++
 			}
 		}
@@ -483,30 +567,12 @@ func cacheViewDel(view *RRCacheView, v interface{}) (n int) {
 			}
 		}
 		for _, rr := range todel {
-			var ok1, ok2 bool
-			for o, ok := view.nameList.Delete(rr); ok && o != nil; {
-				ok1 = true
-				o, ok = view.nameList.Delete(rr)
-			}
-			for o, ok := view.expList.Delete(rr); ok && o != nil; {
-				ok2 = true
-				o, ok = view.expList.Delete(rr)
-			}
-			if ok1 || ok2 {
+			if _, ok := view.remove(rr); ok {
 				n++
 			}
 		}
 	case RR:
-		var ok1, ok2 bool
-		for o, ok := view.nameList.Delete(r); ok && o != nil; {
-			ok1 = true
-			o, ok = view.nameList.Delete(r)
-		}
-		for o, ok := view.expList.Delete(r); ok && o != nil; {
-			ok2 = true
-			o, ok = view.expList.Delete(r)
-		}
-		if ok1 || ok2 {
+		if _, ok := view.remove(r); ok {
 			n++
 		}
 	}
@@ -700,7 +766,7 @@ func (cache *RRCache) Lookup(qr ...dns.Question) ([]RR, error) {
 	soaMatchers := make(map[string]Matcher)
 	matchers := make([]Matcher, 0, 2)
 	for _, q := range qr {
-		var m *matcher
+		var m MutableMatcher
 		name := dns.Fqdn(strings.ToLower(q.Name))
 		labels := dns.Split(name)
 		if _, ok := soaMatchers[name]; !ok {

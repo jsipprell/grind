@@ -14,18 +14,24 @@ const (
 	MatchOpLabel
 	MatchOpType
 	MatchOpClass
-	MatchOpData
+	MatchOpRRData
 	MatchOpTypeSlice
 )
 
 type MatchOp int
 
+type RRish interface {
+	GetRR() RR
+}
+
 type Matcher interface {
 	Name() string
-	GetRR() RR
-	Type() uint16
-	Class() uint16
 	Match(interface{}) bool
+}
+
+type MutableMatcher interface {
+	Matcher
+	AddMatch(MatchOp,interface{})
 }
 
 type matchOp struct {
@@ -34,10 +40,17 @@ type matchOp struct {
 }
 
 type matcher struct {
-	RR
-
-	name *string
 	ops  []matchOp
+}
+
+type rrMatcher struct {
+	RR
+	m *matcher
+}
+
+type nameMatcher struct {
+	*matcher
+	name string
 }
 
 func (op MatchOp) String() string {
@@ -50,8 +63,8 @@ func (op MatchOp) String() string {
 		return "MatchOpType"
 	case MatchOpClass:
 		return "MatchOpClass"
-	case MatchOpData:
-		return "MatchOpData"
+	case MatchOpRRData:
+		return "MatchOpRRData"
 	case MatchOpTypeSlice:
 		return "MatchOpTypeSlice"
 	default:
@@ -59,38 +72,58 @@ func (op MatchOp) String() string {
 	}
 }
 
-func newMatcher(v interface{}) *matcher {
-	var rr RR
-	var name *string
+func (nm *nameMatcher) GoString() string {
+	return fmt.Sprintf("<%s: %#v>", nm.name, nm.matcher)
+}
+
+func newMatcher(v interface{}) MutableMatcher {
+	m := &matcher{ops:make([]matchOp, 0, 1)}
 
 	switch t := v.(type) {
 	case RR:
-		rr = t
+		return &rrMatcher{RR:t,m:m}
 	case string:
-		name = &t
+		return &nameMatcher{matcher:m,name:t}
 	case fmt.Stringer:
-		s := dns.Fqdn(strings.ToLower(t.String()))
-		name = &s
+		return &nameMatcher{matcher:m,name:dns.Fqdn(strings.ToLower(t.String()))}
 	}
-	return &matcher{RR: rr, name: name, ops: make([]matchOp, 0, 1)}
+	panic("unsupported matcher type")
+}
+
+// returns a new matcher based on an existing RR that will match as specifically as possible
+// based on rr contents (type, class, data, etc) but without requiring exact identity.
+func newMatcherFromRR(r RRish) Matcher {
+	rr := r.GetRR()
+	m := &nameMatcher{
+		matcher:&matcher{ops:make([]matchOp, 0, 3)},
+		name:rr.Name(),
+	}
+
+	m.AddMatch(MatchOpName, rr.Name())
+	m.AddMatch(MatchOpType, rr.Type())
+	m.AddMatch(MatchOpClass, rr.Class())
+	m.AddMatch(MatchOpRRData, rr.dnsRR())
+	return m
 }
 
 func (m *matcher) AddMatch(op MatchOp, v interface{}) {
 	m.ops = append(m.ops, matchOp{op, v})
 }
 
-func (m *matcher) Name() string {
-	if m.name != nil {
-		return *m.name
-	} else if m.RR != nil {
-		return m.RR.Name()
-	}
-
-	return ""
+func (m *nameMatcher) Name() string {
+	return m.name
 }
 
-func (m *matcher) GetRR() RR {
+func (m *rrMatcher) GetRR() RR {
 	return m.RR
+}
+
+func (m *rrMatcher) Match(v interface{}) bool {
+	return m.m.Match(v)
+}
+
+func (m *rrMatcher) AddMatch(op MatchOp, v interface{}) {
+	m.m.AddMatch(op,v)
 }
 
 func (m *matcher) Match(v interface{}) bool {
@@ -121,6 +154,8 @@ func (m *matcher) Match(v interface{}) bool {
 				}
 			case MatchOpClass:
 				ok = rr.Class() == op.value.(uint16)
+			case MatchOpRRData:
+				ok = CompareRRData(rr.dnsRR(), op.value.(dns.RR))
 			}
 			_ = log.Printf
 			//log.Printf("%v/%v[%v/%v/%v] got %+v: %v", op.op, op.value, m.Name(),rr.Name(),rr.Type(), v, ok)
@@ -130,6 +165,14 @@ func (m *matcher) Match(v interface{}) bool {
 		}
 	}
 	return ok
+}
+
+func GetRR(m Matcher) (RR, bool) {
+	r, ok := m.(RRish)
+	if ok {
+		return r.GetRR(), ok
+	}
+	return nil, ok
 }
 
 // compare rrdata for two RRs.. hdrs must already match

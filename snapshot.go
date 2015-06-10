@@ -83,12 +83,23 @@ func snapshotClose(s *snapshot, ctx context.Context, c chan<- struct{}) {
 
 func (s *snapshot) clearView() {
 	s.snapset = make([]snapOperation, 0, len(s.snapset))
-	for i := s.expList.SeekToFirst(); i != nil; i = s.expList.SeekToFirst() {
-		if rr, ok := i.Key().(RR); ok {
-			s.expList.Delete(rr)
-			s.nameList.Delete(rr)
+	i := s.expList.SeekToFirst()
+	if i != nil {
+		defer i.Close()
+		ok := true
+		for v := i.Key(); ok; v = i.Key() {
+			ok = i.Next()
+			s.expList.Delete(v)
 		}
-		//i.Close()
+	}
+	j := s.nameList.SeekToFirst()
+	if j != nil {
+		defer j.Close()
+		ok := true
+		for v := j.Key(); ok; v = j.Key() {
+			ok = j.Next()
+			s.nameList.Delete(v)
+		}
 	}
 }
 
@@ -102,13 +113,14 @@ func (s *snapshot) runFlush(fl snapReqFlush) error {
 		switch op.op {
 		case snapOpAdd:
 			log.Printf("SNAP ADD: %+v", op.v)
-			s.Cache.update(op.v)
+			s.Cache.update(op.v.(Matcher))
 		case snapOpDel:
 			log.Printf("SNAP DEL: %+v", op.v)
-			s.Cache.del(op.v)
+			s.Cache.remove(op.v.(Matcher))
 		}
 	}
 	s.Cache.verbose = false
+	log.Println("SNAP MAINT DONE")
 	return nil
 }
 
@@ -159,9 +171,8 @@ func (s *snapshot) runExpire(now time.Time) (nexpired int) {
 			return
 		}
 		nexpired++
-		s.addToSnapshot(snapOpDel, rr)
-		s.expList.Delete(rr)
-		s.nameList.Delete(rr)
+		s.addToSnapshot(snapOpDel, newMatcherFromRR(rr.GetRR()))
+		s.remove(rr)
 		if !i.Next() {
 			break
 		}
