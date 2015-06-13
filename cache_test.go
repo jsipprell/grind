@@ -9,7 +9,7 @@ import (
 	"github.com/ryszard/goskiplist/skiplist"
 )
 
-func testNewRR(t *testing.T, f string, args ...interface{}) *RR {
+func testNewRR(t *testing.T, f string, args ...interface{}) RR {
 	rr, err := dns.NewRR(fmt.Sprintf(f, args...))
 	if err != nil {
 		t.Fatal(err)
@@ -25,7 +25,7 @@ func dumpSkipList(t *testing.T, sl *skiplist.SkipList) {
 	count := 1
 	defer i.Close()
 	for ok := true; ok; ok = i.Next() {
-		rr, _ := i.Key().(*RR)
+		rr, _ := i.Key().(RR)
 		zone, _ := i.Value().(*Zone)
 		t.Logf("%d: %s   (%v)", count, rr.ZoneString(), zone)
 		count++
@@ -41,7 +41,7 @@ func seekSkipList(t *testing.T, sl *skiplist.SkipList, seekTo interface{}) {
 	defer i.Close()
 
 	for ok := true; ok; ok = i.Next() {
-		rr, _ := i.Key().(*RR)
+		rr, _ := i.Key().(RR)
 		zone, _ := i.Value().(*Zone)
 		t.Logf("%d: %s   (%v)", count, rr.ZoneString(), zone)
 		count++
@@ -56,7 +56,7 @@ func TestRRCacheView(t *testing.T) {
 	rr = testNewRR(t, "testies. IN 22 MX 10 mail.testies.")
 	cacheViewAdd(view, rr)
 	rr = testNewRR(t, "mail.testies. IN 8 A 192.168.70.1")
-	t.Logf("%#v", rr.RR)
+	t.Logf("%#v", rr.dnsRR())
 	cacheViewAdd(view, rr)
 	time.Sleep(1000 * time.Millisecond)
 	dumpSkipList(t, view.expList)

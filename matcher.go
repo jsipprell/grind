@@ -24,9 +24,14 @@ type RRish interface {
 	GetRR() RR
 }
 
-type Matcher interface {
+type Labeled interface {
 	Name() string
+}
+
+type Matcher interface {
+	Labeled
 	Match(interface{}) bool
+	Less(interface{}) bool
 }
 
 type MutableMatcher interface {
@@ -72,8 +77,16 @@ func (op MatchOp) String() string {
 	}
 }
 
+func (rr *rrMatcher) Less(v interface{}) bool {
+	return rr.Name() < v.(RR).Name()
+}
+
 func (nm *nameMatcher) GoString() string {
 	return fmt.Sprintf("<%s: %#v>", nm.name, nm.matcher)
+}
+
+func (nm *nameMatcher) Less(v interface{}) bool {
+	return nm.name < v.(RR).Name()
 }
 
 func newMatcher(v interface{}) MutableMatcher {
@@ -88,6 +101,12 @@ func newMatcher(v interface{}) MutableMatcher {
 		return &nameMatcher{matcher:m,name:dns.Fqdn(strings.ToLower(t.String()))}
 	}
 	panic("unsupported matcher type")
+}
+
+func newNameMatcher(v interface{}) MutableMatcher {
+	m := newMatcher(v)
+	m.AddMatch(MatchOpName, m.Name())
+	return m
 }
 
 // returns a new matcher based on an existing RR that will match as specifically as possible
@@ -158,7 +177,7 @@ func (m *matcher) Match(v interface{}) bool {
 				ok = CompareRRData(rr.dnsRR(), op.value.(dns.RR))
 			}
 			_ = log.Printf
-			//log.Printf("%v/%v[%v/%v/%v] got %+v: %v", op.op, op.value, m.Name(),rr.Name(),rr.Type(), v, ok)
+			//log.Printf("%v/%v[%v/%v] got %+v: %v", op.op, op.value, rr.Name(),rr.Type(), v, ok)
 			if !ok {
 				return ok
 			}

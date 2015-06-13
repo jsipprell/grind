@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jsipprell/grind/db"
 	"github.com/jsipprell/grind/barricade"
 	"github.com/miekg/dns"
 	"github.com/ryszard/goskiplist/skiplist"
@@ -20,6 +21,22 @@ var (
 
 type RRCacher interface {
 	View() *RRCacheView
+}
+
+type RREqualing interface {
+	db.Equaling
+	db.Expiring
+	RRish
+
+	dnsRR() dns.RR
+	calcTTL() uint32
+
+	ZoneString() string
+
+	Name() string
+	Type() uint16
+	Class() uint16
+	Clone() RR
 }
 
 type RR interface {
@@ -58,6 +75,10 @@ type rrec struct {
 	rcode *uint16
 	expAt time.Time
 	Key   string
+}
+
+func (rr *rrec) Less(v interface{}) bool {
+	return rr.Name() < v.(RR).Name()
 }
 
 func (rr *rrec) ExpireAt() time.Time {
@@ -611,6 +632,14 @@ func (r *rrec) Rdlength() uint16 {
 
 func (r *rrec) GetRR() RR {
 	return r
+}
+
+func (r *rrec) Equal(v interface{}) bool {
+	if t, ok := v.(RR); ok {
+		return t.Name() == r.Name() &&  t.Class() == r.Class() && CompareRRData(t.dnsRR(), r.RR)
+	}
+
+	return false
 }
 
 func (r *rrec) Match(v interface{}) bool {
